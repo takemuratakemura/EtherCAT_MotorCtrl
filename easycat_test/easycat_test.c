@@ -1,117 +1,98 @@
-2024/5/27生成（DS-402 & アプリケーションマニュアル織り込み済み
-
 #include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <ecrt.h>
+#include <stdlib.h>
+#include <ethercat.h>
 
-// EtherCATマスターインスタンス
-static ec_master_t *master = NULL;
-static ec_domain_t *domain1 = NULL;
-static ec_slave_config_t *sc = NULL;
+#define EC_TIMEOUTMON 500
 
-// PDO entry offsets
-static unsigned int off_control_word;
-static unsigned int off_position_actual_value;
-static unsigned int off_digital_inputs;
-static unsigned int off_status_word;
-static unsigned int off_target_torque;
-static unsigned int off_mode_of_operation;
+char IOmap[4096];
+int expectedWKC;
+volatile int wkc;
+boolean needlf = FALSE;
+boolean inOP = FALSE;
 
-// 定義
-#define VENDOR_ID 0x00000002
-#define PRODUCT_ID 0x00030924
-#define REVISION_NO 0x00000001
+// モータードライバの設定値
+#define TORQUE_INDEX 0x6071
+#define TORQUE_SUBINDEX 0
+#define MODE_OF_OPERATION_INDEX 0x6060
+#define CONTROL_WORD_INDEX 0x6040
 
-// 更新周期（例：1ms）
-#define PERIOD_NS (1000000)
+// 制御ワードのビット定義
+#define ERROR_RESET_BIT 7
+#define SWITCH_ON_BIT 0
 
-void cyclic_task(void)
+void simpletest(char *ifname)
 {
-    // Domainデータ
-    uint8_t *domain1_pd = ec_domain_data(domain1);
+    int oloop, iloop;
+    int chk;
 
-    // 制御ワードとトルク指令を設定
-    EC_WRITE_U16(domain1_pd + off_control_word, 0x000F); // 制御ワード（例：運転イネーブル）
-    EC_WRITE_S16(domain1_pd + off_target_torque, 100);  // トルク指令（例：100）
+    // EtherCATスレーブの初期化
+    if (ec_init(ifname)) {
+        printf("EtherCAT初期化に成功: %s\n", ifname);
 
-    // サイクリック同期トルクモードを設定
-    EC_WRITE_S8(domain1_pd + off_mode_of_operation, 0x0A); // モード設定（CST）
+        // スレーブの検出
+        if (ec_config_init(FALSE) > 0) {
+            printf("%dスレーブが見つかりました\n", ec_slavecount);
 
-    // Process Dataを更新
-    ecrt_domain_queue(domain1);
-    ecrt_master_send(master);
-    ecrt_master_receive(master);
-    ecrt_domain_process(domain1);
+            ec_config_map(&IOmap);
+            ec_configdc();
+
+            printf("PDOマッピングを行います\n");
+
+            // 制御ワードの初期設定
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] = 0x0000;
+
+            // エラーリセット
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] |= (1 << ERROR_RESET_BIT);
+
+            // 操作モードの設定 (Cyclic Synchronous Torque mode)
+            ec_slave[1].outputs[MODE_OF_OPERATION_INDEX] = (int8_t)0x04;
+
+            // 制御ワードの設定 (Switch On)
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] |= (1 << SWITCH_ON_BIT);
+
+            // PDOマッピング
+            expectedWKC = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC;
+            printf("要求されたWKC: %d\n", expectedWKC);
+
+            // サイクリックデータ交換を開始
+            ec_slave[0].state = EC_STATE_OPERATIONAL;
+            ec_send_processdata();
+            ec_receive_processdata(EC_TIMEOUTRET);
+
+            // メインループ
+            while (1) {
+                // トルク指令の送信
+                int16_t torque_command = 1000; // ここでトルク指令値を設定
+                ec_slave[1].outputs[TORQUE_INDEX] = torque_command;
+
+                // データ交換
+                ec_send_processdata();
+                wkc = ec_receive_processdata(EC_TIMEOUTRET);
+
+                if (wkc < expectedWKC) {
+                    printf("プロセスデータ交換エラー\n");
+                }
+
+                // 1ms待機
+                osal_usleep(1000);
+            }
+        }
+        else {
+            printf("スレーブが見つかりません\n");
+        }
+    }
+    else {
+        printf("EtherCAT初期化に失敗: %s\n", ifname);
+    }
 }
 
-int main(int argc, char **argv)
+int main(int argc, char *argv[])
 {
-    // EtherCATマスターインスタンスの取得
-    master = ecrt_request_master(0);
-    if (!master) {
-        fprintf(stderr, "Failed to acquire master!\n");
-        return -1;
-    }
-
-    // ドメインの作成
-    domain1 = ecrt_master_create_domain(master);
-    if (!domain1) {
-        fprintf(stderr, "Failed to create domain!\n");
-        return -1;
-    }
-
-    // スレーブの構成
-    sc = ecrt_master_slave_config(master, 0, VENDOR_ID, PRODUCT_ID);
-    if (!sc) {
-        fprintf(stderr, "Failed to configure slave!\n");
-        return -1;
-    }
-
-    // PDOエントリの設定
-    ec_pdo_entry_reg_t domain1_regs[] = {
-        {0, VENDOR_ID, PRODUCT_ID, 0x6040, 0, &off_control_word},         // Control word
-        {0, VENDOR_ID, PRODUCT_ID, 0x6064, 0, &off_position_actual_value}, // Position actual value
-        {0, VENDOR_ID, PRODUCT_ID, 0x60FD, 0, &off_digital_inputs},       // Digital Inputs
-        {0, VENDOR_ID, PRODUCT_ID, 0x6041, 0, &off_status_word},          // Status word
-        {0, VENDOR_ID, PRODUCT_ID, 0x6071, 0, &off_target_torque},        // Target Torque
-        {0, VENDOR_ID, PRODUCT_ID, 0x6060, 0, &off_mode_of_operation},    // Modes of Operation
-        {}
-    };
-
-    if (ecrt_domain_reg_pdo_entry_list(domain1, domain1_regs)) {
-        fprintf(stderr, "PDO entry registration failed!\n");
-        return -1;
-    }
-
-    // マスターのアクティブ化
-    if (ecrt_master_activate(master)) {
-        fprintf(stderr, "Master activation failed!\n");
-        return -1;
-    }
-
-    // ドメインプロセスデータの取得
-    if (!(domain1_pd = ecrt_domain_data(domain1))) {
-        fprintf(stderr, "Failed to get domain data pointer!\n");
-        return -1;
-    }
-
-    // デバイス初期化シーケンス
-    EC_WRITE_U16(domain1_pd + off_control_word, 0x0080); // エラーリセット
-    usleep(10000); // 10ms待機
-    EC_WRITE_U16(domain1_pd + off_control_word, 0x0006); // スイッチオン準備
-    usleep(10000); // 10ms待機
-    EC_WRITE_U16(domain1_pd + off_control_word, 0x0007); // スイッチオン
-    usleep(10000); // 10ms待機
-    EC_WRITE_U16(domain1_pd + off_control_word, 0x000F); // 運転イネーブル
-    usleep(10000); // 10ms待機
-
-    // サイクルタスクの実行
-    while (1) {
-        cyclic_task();
-        usleep(PERIOD_NS / 1000);
+    if (argc > 1) {
+        simpletest(argv[1]);
+    } else {
+        printf("使用法: %s [ネットワークインターフェース]\n", argv[0]);
     }
 
     return 0;
 }
-
