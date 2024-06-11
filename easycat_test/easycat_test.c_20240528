@@ -1,0 +1,98 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <ethercat.h>
+
+#define EC_TIMEOUTMON 500
+
+char IOmap[4096];
+int expectedWKC;
+volatile int wkc;
+boolean needlf = FALSE;
+boolean inOP = FALSE;
+
+// モータードライバの設定値
+#define TORQUE_INDEX 0x6071
+#define TORQUE_SUBINDEX 0
+#define MODE_OF_OPERATION_INDEX 0x6060
+#define CONTROL_WORD_INDEX 0x6040
+
+// 制御ワードのビット定義
+#define ERROR_RESET_BIT 7
+#define SWITCH_ON_BIT 0
+
+void simpletest(char *ifname)
+{
+    int oloop, iloop;
+    int chk;
+
+    // EtherCATスレーブの初期化
+    if (ec_init(ifname)) {
+        printf("EtherCAT初期化に成功: %s\n", ifname);
+
+        // スレーブの検出
+        if (ec_config_init(FALSE) > 0) {
+            printf("%dスレーブが見つかりました\n", ec_slavecount);
+
+            ec_config_map(&IOmap);
+            ec_configdc();
+
+            printf("PDOマッピングを行います\n");
+
+            // 制御ワードの初期設定
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] = 0x0000;
+
+            // エラーリセット
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] |= (1 << ERROR_RESET_BIT);
+
+            // 操作モードの設定 (Cyclic Synchronous Torque mode)
+            ec_slave[1].outputs[MODE_OF_OPERATION_INDEX] = (int8_t)0x04;
+
+            // 制御ワードの設定 (Switch On)
+            ec_slave[1].outputs[CONTROL_WORD_INDEX] |= (1 << SWITCH_ON_BIT);
+
+            // PDOマッピング
+            expectedWKC = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC;
+            printf("要求されたWKC: %d\n", expectedWKC);
+
+            // サイクリックデータ交換を開始
+            ec_slave[0].state = EC_STATE_OPERATIONAL;
+            ec_send_processdata();
+            ec_receive_processdata(EC_TIMEOUTRET);
+
+            // メインループ
+            while (1) {
+                // トルク指令の送信
+                int16_t torque_command = 1000; // ここでトルク指令値を設定
+                ec_slave[1].outputs[TORQUE_INDEX] = torque_command;
+
+                // データ交換
+                ec_send_processdata();
+                wkc = ec_receive_processdata(EC_TIMEOUTRET);
+
+                if (wkc < expectedWKC) {
+                    printf("プロセスデータ交換エラー\n");
+                }
+
+                // 1ms待機
+                osal_usleep(1000);
+            }
+        }
+        else {
+            printf("スレーブが見つかりません\n");
+        }
+    }
+    else {
+        printf("EtherCAT初期化に失敗: %s\n", ifname);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc > 1) {
+        simpletest(argv[1]);
+    } else {
+        printf("使用法: %s [ネットワークインターフェース]\n", argv[0]);
+    }
+
+    return 0;
+}
