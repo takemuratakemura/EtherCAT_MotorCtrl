@@ -1,0 +1,6 @@
+編集ファイル：
+SOEM-master/test/linux/easycat_test/easycat_test.c
+
+実行方法：
+build配下でmake
+sudo ./test/linux/easycat_test/easycat_test eth0
